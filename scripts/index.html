@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"></head>
+<body>
+<script>
+/**
+ * Incident Responder — on-device log analysis skill
+ * Parses raw log text, extracts patterns, and returns structured findings.
+ * All processing is local — no data leaves the device.
+ */
+
+window['ai_edge_gallery_get_result'] = async (data) => {
+  try {
+    const { logs = '', logType = 'generic', focusArea = '' } = JSON.parse(data);
+
+    if (!logs || logs.trim().length === 0) {
+      return JSON.stringify({ error: 'No log content provided. Please paste log lines into your message.' });
+    }
+
+    const lines = logs.split('\n').filter(l => l.trim().length > 0);
+    const sample = lines.slice(-1000); // last 1,000 lines
+
+    const analysis = analyzeLog(sample, logType, focusArea);
+
+    return JSON.stringify({ result: formatResult(analysis, logType, focusArea) });
+  } catch (e) {
+    return JSON.stringify({ error: `Incident Responder failed: ${e.message}` });
+  }
+};
+
+// ─── Parsers ────────────────────────────────────────────────────────────────
+
+function analyzeLog(lines, logType, focusArea) {
+  const out = {
+    totalLines: lines.length,
+    logType,
+    focusArea,
+    timeRange: extractTimeRange(lines, logType),
+    errorCounts: {},
+    topErrors: [],
+    statusCodes: {},
+    ipCounts: {},
+    serviceCounts: {},
+    criticalLines: [],
+    warningLines: [],
+    patterns: []
+  };
+
+  for (const line of lines) {
+    const lower = line.toLowerCase();
+
+    // ── Status codes (Nginx/Apache) ──────────────────────────────────────────
+    const statusMatch = line.match(/\s(2\d{2}|3\d{2}|4\d{2}|5\d{2})\s/);
+    if (statusMatch) {
+      const code = statusMatch[1];
+      out.statusCodes[code] = (out.statusCodes[code] || 0) + 1;
+    }
+
+    // ── IP addresses ──────────────────────────────────────────────────────────
+    const ipMatch = line.match(/^(\d{1,3}(?:\.\d{1,3}){3})/);
+    if (ipMatch) {
+      const ip = ipMatch[1];
+      out.ipCounts[ip] = (out.ipCounts[ip] || 0) + 1;
+    }
+
+    // ── Systemd/journald service names ────────────────────────────────────────
+    const svcMatch = line.match(/\s([a-zA-Z0-9_\-]+)\[(\d+)\]:/);
+    if (svcMatch) {
+      const svc = svcMatch[1];
+      out.serviceCounts[svc] = (out.serviceCounts[svc] || 0) + 1;
+    }
+
+    // ── Severity classification ───────────────────────────────────────────────
+    const isCritical = /\b(crit|critical|emerg|alert|fatal|panic|oom|out of memory|segfault|kernel panic|disk full|no space left)\b/i.test(line);
+    const isError    = /\b(error|err\b|failed|failure|refused|denied|exception|traceback|abort)\b/i.test(line);
+    const isWarn     = /\b(warn|warning|deprecated|slow|timeout|retry|retrying)\b/i.test(line);
+
+    if (isCritical) {
+      out.criticalLines.push(line.slice(0, 200));
+    } else if (isError && out.criticalLines.length + out.warningLines.length < 40) {
+      out.warningLines.push(line.slice(0, 200));
+    } else if (isWarn && out.warningLines.length < 20) {
+      out.warningLines.push(line.slice(0, 200));
+    }
+
+    // ── Named error pattern extraction ────────────────────────────────────────
+    const patterns = [
+      { re: /connection refused/i,           key: 'Connection Refused' },
+      { re: /timeout/i,                      key: 'Timeout' },
+      { re: /out of memory|oom/i,            key: 'OOM / Memory Exhaustion' },
+      { re: /no space left|disk full/i,      key: 'Disk Full' },
+      { re: /segfault|segmentation fault/i,  key: 'Segfault' },
+      { re: /too many open files/i,          key: 'File Descriptor Limit' },
+      { re: /ssl.*error|certificate/i,       key: 'SSL / Certificate Error' },
+      { re: /upstream.*failed|upstream timed out/i, key: 'Upstream Failure' },
+      { re: /permission denied/i,            key: 'Permission Denied' },
+      { re: /authentication fail/i,          key: 'Auth Failure' },
+      { re: /database|db.*error|sql/i,       key: 'Database Error' },
+      { re: /rate.?limit|too many requests/i, key: 'Rate Limiting' },
+      { re: /high.*load|load average/i,      key: 'High Load' },
+    ];
+
+    for (const { re, key } of patterns) {
+      if (re.test(line)) {
+        out.errorCounts[key] = (out.errorCounts[key] || 0) + 1;
+      }
+    }
+  }
+
+  // ── Derived aggregates ────────────────────────────────────────────────────
+  out.topErrors = Object.entries(out.errorCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([name, count]) => ({ name, count }));
+
+  out.topIPs = Object.entries(out.ipCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([ip, count]) => ({ ip, count }));
+
+  out.topServices = Object.entries(out.serviceCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([svc, count]) => ({ svc, count }));
+
+  // ── 5xx spike detection ───────────────────────────────────────────────────
+  const total5xx = Object.entries(out.statusCodes)
+    .filter(([c]) => c.startsWith('5'))
+    .reduce((s, [, n]) => s + n, 0);
+  const total2xx = Object.entries(out.statusCodes)
+    .filter(([c]) => c.startsWith('2'))
+    .reduce((s, [, n]) => s + n, 0);
+  const totalRequests = Object.values(out.statusCodes).reduce((s, n) => s + n, 0);
+
+  out.errorRate5xx = totalRequests > 0
+    ? ((total5xx / totalRequests) * 100).toFixed(1)
+    : null;
+  out.total5xx = total5xx;
+  out.total2xx = total2xx;
+  out.totalRequests = totalRequests;
+
+  // ── Burst detection (naive: concentration in last 10% of lines) ──────────
+  const tailSize = Math.max(10, Math.floor(lines.length * 0.1));
+  const tailLines = lines.slice(-tailSize);
+  const tailErrors = tailLines.filter(l =>
+    /\b(error|failed|crit|5\d{2})\b/i.test(l)
+  ).length;
+  out.recentErrorBurst = tailErrors > tailSize * 0.3;
+  out.tailErrorCount = tailErrors;
+  out.tailSize = tailSize;
+
+  return out;
+}
+
+// ─── Time range extraction ───────────────────────────────────────────────────
+
+function extractTimeRange(lines, logType) {
+  const timestamps = [];
+
+  for (const line of lines) {
+    // ISO 8601
+    let m = line.match(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/);
+    if (m) { timestamps.push(m[0]); continue; }
+    // Nginx/Apache common log format: [10/Oct/2024:13:55:36 +0000]
+    m = line.match(/\[(\d{2}\/\w+\/\d{4}:\d{2}:\d{2}:\d{2})/);
+    if (m) { timestamps.push(m[1]); continue; }
+    // syslog: Jan 15 03:22:11
+    m = line.match(/^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})/);
+    if (m) { timestamps.push(m[1]); }
+  }
+
+  if (timestamps.length === 0) return null;
+  return { first: timestamps[0], last: timestamps[timestamps.length - 1] };
+}
+
+// ─── Formatter ───────────────────────────────────────────────────────────────
+
+function formatResult(a, logType, focusArea) {
+  const lines = [];
+
+  lines.push(`=== INCIDENT RESPONDER ANALYSIS ===`);
+  lines.push(`Log type   : ${a.logType.toUpperCase()}`);
+  lines.push(`Lines read : ${a.totalLines}${a.totalLines === 1000 ? ' (capped at 1,000)' : ''}`);
+  if (a.timeRange) {
+    lines.push(`Time range : ${a.timeRange.first}  →  ${a.timeRange.last}`);
+  }
+  if (focusArea) lines.push(`Focus area : ${focusArea}`);
+
+  lines.push('');
+
+  // HTTP status summary
+  if (a.totalRequests > 0) {
+    lines.push(`--- HTTP STATUS BREAKDOWN ---`);
+    const groups = {};
+    for (const [code, count] of Object.entries(a.statusCodes)) {
+      const g = code[0] + 'xx';
+      groups[g] = (groups[g] || 0) + count;
+    }
+    for (const [g, n] of Object.entries(groups).sort()) {
+      const pct = ((n / a.totalRequests) * 100).toFixed(1);
+      lines.push(`  ${g}: ${n} (${pct}%)`);
+    }
+    lines.push(`  Total requests : ${a.totalRequests}`);
+    if (a.errorRate5xx !== null) {
+      lines.push(`  5xx error rate : ${a.errorRate5xx}%${parseFloat(a.errorRate5xx) > 5 ? ' ⚠️  ELEVATED' : ' ✅'}`);
+    }
+  }
+
+  // Named error patterns
+  if (a.topErrors.length > 0) {
+    lines.push('');
+    lines.push(`--- ERROR PATTERNS ---`);
+    for (const { name, count } of a.topErrors) {
+      lines.push(`  ${name}: ${count}x`);
+    }
+  }
+
+  // Recent burst
+  if (a.recentErrorBurst) {
+    lines.push('');
+    lines.push(`⚠️  BURST DETECTED: ${a.tailErrorCount} errors in the last ${a.tailSize} log lines — activity is accelerating.`);
+  }
+
+  // Top IPs
+  if (a.topIPs.length > 0) {
+    lines.push('');
+    lines.push(`--- TOP SOURCE IPs ---`);
+    for (const { ip, count } of a.topIPs) {
+      lines.push(`  ${ip}: ${count} requests`);
+    }
+  }
+
+  // Top services
+  if (a.topServices.length > 0) {
+    lines.push('');
+    lines.push(`--- NOISY SERVICES ---`);
+    for (const { svc, count } of a.topServices) {
+      lines.push(`  ${svc}: ${count} log lines`);
+    }
+  }
+
+  // Critical lines
+  if (a.criticalLines.length > 0) {
+    lines.push('');
+    lines.push(`--- CRITICAL / FATAL LINES (first ${Math.min(a.criticalLines.length, 5)}) ---`);
+    for (const l of a.criticalLines.slice(0, 5)) {
+      lines.push(`  > ${l}`);
+    }
+  }
+
+  // Sample errors
+  if (a.warningLines.length > 0) {
+    lines.push('');
+    lines.push(`--- SAMPLE ERROR / WARNING LINES (first ${Math.min(a.warningLines.length, 5)}) ---`);
+    for (const l of a.warningLines.slice(0, 5)) {
+      lines.push(`  > ${l}`);
+    }
+  }
+
+  lines.push('');
+  lines.push(`=== END OF ANALYSIS ===`);
+
+  return lines.join('\n');
+}
+</script>
+</body>
+</html>
